@@ -3,40 +3,39 @@ import os
 import time
 import secrets
 import smtplib
-import re
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-
 import streamlit as st
+
+from email.message import EmailMessage
 from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
 
 
-# --------------------------------------------------
-# PAGE CONFIGURATION
-# --------------------------------------------------
+# ---------------- PAGE CONFIGURATION ----------------
 
 st.set_page_config(
-    page_title="PragyanAI - OTP Verification",
+    page_title="OTP Verification System",
     page_icon="🔐",
     layout="centered"
 )
 
+st.title("🔐 PragyanAI OTP Verification System")
+st.write("Verify your email address and phone number securely using OTPs.")
 
-# --------------------------------------------------
-# SECRETS CONFIGURATION
-# Supports Streamlit Cloud secrets and environment
-# variables for local development.
-# --------------------------------------------------
+OTP_EXPIRY = 300  # 5 minutes
 
-def get_secret(key, default=""):
+
+# ---------------- LOAD SECRETS ----------------
+
+def get_secret(key):
+    """Read a secret from Streamlit secrets or environment variables."""
     try:
-        value = st.secrets.get(key, default)
+        value = st.secrets.get(key)
         if value:
-            return str(value)
+            return str(value).strip()
     except Exception:
         pass
 
-    return os.getenv(key, default)
+    return os.getenv(key, "").strip()
 
 
 EMAIL_ADDRESS = get_secret("EMAIL_ADDRESS")
@@ -48,22 +47,16 @@ TWILIO_VERIFY_SERVICE_SID = get_secret(
     "TWILIO_VERIFY_SERVICE_SID"
 )
 
-OTP_EXPIRY = 300  # 5 minutes
 
-
-# --------------------------------------------------
-# SESSION STATE
-# Each browser session maintains its own email OTP.
-# --------------------------------------------------
+# ---------------- INITIALIZE SESSION STATE ----------------
 
 defaults = {
     "email_otp": None,
     "email_otp_time": None,
-    "email_otp_address": None,
     "email_verified": False,
-    "verified_email_address": None,
+    "phone_verification_sent": False,
     "phone_verified": False,
-    "verified_phone_number": None,
+    "phone_number": "",
 }
 
 for key, value in defaults.items():
@@ -71,381 +64,275 @@ for key, value in defaults.items():
         st.session_state[key] = value
 
 
-# --------------------------------------------------
-# HELPER FUNCTIONS
-# --------------------------------------------------
+# ---------------- EMAIL OTP FUNCTIONS ----------------
 
-def generate_otp():
-    """Generate a cryptographically secure 6-digit OTP."""
-    return f"{secrets.randbelow(900000) + 100000}"
-
-
-def get_twilio_client():
-    """Create a Twilio client when credentials exist."""
-    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-        raise ValueError(
-            "Twilio credentials are missing. "
-            "Configure your Streamlit secrets."
-        )
-
-    return Client(
-        TWILIO_ACCOUNT_SID,
-        TWILIO_AUTH_TOKEN
-    )
-
-
-def send_email_otp(recipient, otp):
-    """Send an OTP through Gmail SMTP."""
-
+def send_email_otp(email):
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        raise ValueError(
+        st.error(
             "Email credentials are missing. "
             "Configure EMAIL_ADDRESS and EMAIL_APP_PASSWORD."
         )
+        return
 
-    message = MIMEMultipart()
-    message["From"] = EMAIL_ADDRESS
-    message["To"] = recipient
+    otp = f"{secrets.randbelow(900000) + 100000}"
+
+    message = EmailMessage()
     message["Subject"] = "Your PragyanAI Verification OTP"
-
-    body = f"""
-Hello,
-
-Your OTP for email verification is:
-
-{otp}
-
-This OTP is valid for 5 minutes.
-Please do not share this OTP with anyone.
-
-Regards,
-PragyanAI
-"""
-
-    message.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
-        server.starttls()
-        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-        server.sendmail(
-            EMAIL_ADDRESS,
-            recipient,
-            message.as_string()
-        )
-
-
-def send_email(email):
-    """Validate email and send a new OTP."""
-
-    email = email.strip().lower()
-
-    if not email or not re.fullmatch(
-        r"[^@\s]+@[^@\s]+\.[^@\s]+", email
-    ):
-        return "❌ Please enter a valid email address.", "error"
-
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        return (
-            "❌ Email credentials are not configured.",
-            "error"
-        )
-
-    otp = generate_otp()
+    message["From"] = EMAIL_ADDRESS
+    message["To"] = email
+    message.set_content(
+        f"Your OTP is: {otp}\n\n"
+        "This OTP expires in 5 minutes. "
+        "Do not share it with anyone."
+    )
 
     try:
-        send_email_otp(email, otp)
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
+            server.starttls()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(message)
 
         st.session_state.email_otp = otp
         st.session_state.email_otp_time = time.time()
-        st.session_state.email_otp_address = email
         st.session_state.email_verified = False
-        st.session_state.verified_email_address = None
 
-        return "✅ Email OTP sent successfully.", "success"
+        st.success("Email OTP sent successfully!")
 
-    except Exception:
-        # Do not expose credentials or SMTP error details.
+    except smtplib.SMTPAuthenticationError:
+        st.error(
+            "Gmail authentication failed. Check your Gmail address "
+            "and 16-character Google App Password."
+        )
+    except Exception as e:
+        st.error(f"Email sending failed: {e}")
+
+
+def verify_email_otp(user_otp):
+    stored_otp = st.session_state.email_otp
+    sent_time = st.session_state.email_otp_time
+
+    if not stored_otp or sent_time is None:
+        st.error("Please request an email OTP first.")
+        return
+
+    if time.time() - sent_time > OTP_EXPIRY:
         st.session_state.email_otp = None
         st.session_state.email_otp_time = None
-        st.session_state.email_otp_address = None
+        st.error("OTP expired. Please request a new OTP.")
+        return
 
-        return (
-            "❌ Email sending failed. Check your Gmail "
-            "App Password and SMTP configuration.",
-            "error"
-        )
-
-
-def verify_email(email, entered_otp):
-    """Verify an email OTP and enforce its expiry."""
-
-    email = email.strip().lower()
-    entered_otp = entered_otp.strip()
-
-    if not email:
-        return "❌ Please enter your email address.", "error"
-
-    if not entered_otp:
-        return "❌ Please enter the OTP.", "error"
-
-    if not entered_otp.isdigit() or len(entered_otp) != 6:
-        return "❌ Enter a valid 6-digit OTP.", "error"
-
-    if st.session_state.email_otp is None:
-        return "❌ Please request a new OTP.", "error"
-
-    if email != st.session_state.email_otp_address:
-        return (
-            "❌ This OTP belongs to a different email address.",
-            "error"
-        )
-
-    elapsed = time.time() - st.session_state.email_otp_time
-
-    if elapsed > OTP_EXPIRY:
-        st.session_state.email_otp = None
-        st.session_state.email_otp_time = None
-        return (
-            "❌ OTP expired. Please request a new OTP.",
-            "error"
-        )
-
-    if secrets.compare_digest(
-        entered_otp, st.session_state.email_otp
-    ):
+    if secrets.compare_digest(user_otp.strip(), stored_otp):
         st.session_state.email_verified = True
-        st.session_state.verified_email_address = email
         st.session_state.email_otp = None
-        st.session_state.email_otp_time = None
-
-        return "✅ Email verified successfully!", "success"
-
-    return "❌ Invalid OTP.", "error"
+        st.success("Email verified successfully!")
+    else:
+        st.error("Incorrect OTP. Please try again.")
 
 
-def send_phone_otp(phone):
-    """Send an SMS verification through Twilio Verify."""
+# ---------------- TWILIO PHONE OTP FUNCTIONS ----------------
 
-    phone = phone.strip()
-
-    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
-        return (
-            "❌ Enter a valid international number, "
-            "including country code (e.g. +919876543210).",
-            "error"
+def send_phone_otp(phone_number):
+    if not all([
+        TWILIO_ACCOUNT_SID,
+        TWILIO_AUTH_TOKEN,
+        TWILIO_VERIFY_SERVICE_SID,
+    ]):
+        st.error(
+            "Twilio credentials are missing. Check your Streamlit secrets."
         )
+        return
 
-    if not TWILIO_VERIFY_SERVICE_SID:
-        return (
-            "❌ Twilio Verify Service SID is not configured.",
-            "error"
+    if not TWILIO_ACCOUNT_SID.startswith("AC"):
+        st.error("Your Twilio Account SID should start with AC.")
+        return
+
+    if not TWILIO_VERIFY_SERVICE_SID.startswith("VA"):
+        st.error("Your Verify Service SID should start with VA.")
+        return
+
+    phone_number = phone_number.strip()
+
+    if not phone_number.startswith("+") or not phone_number[1:].isdigit():
+        st.error(
+            "Enter a valid international phone number, "
+            "including country code, e.g. +919876543210."
         )
+        return
 
     try:
-        client = get_twilio_client()
-
-        verification = (
-            client.verify.v2
-            .services(TWILIO_VERIFY_SERVICE_SID)
-            .verifications.create(
-                to=phone,
-                channel="sms"
-            )
+        client = Client(
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN
         )
 
+        verification = client.verify.v2.services(
+            TWILIO_VERIFY_SERVICE_SID
+        ).verifications.create(
+            to=phone_number,
+            channel="sms"
+        )
+
+        st.session_state.phone_number = phone_number
+        st.session_state.phone_verification_sent = True
         st.session_state.phone_verified = False
-        st.session_state.verified_phone_number = None
 
-        return (
-            f"✅ SMS OTP request submitted. Status: "
-            f"{verification.status}",
-            "success"
+        st.success(
+            f"Twilio accepted the verification request. "
+            f"Status: {verification.status}"
         )
 
-    except Exception:
-        return (
-            "❌ SMS sending failed. Check your Twilio "
-            "credentials, service SID, and account settings.",
-            "error"
+    except TwilioRestException as e:
+        # Helpful diagnostic; never display account credentials.
+        st.error(f"Twilio error code: {e.code}")
+        st.error(f"Twilio message: {e.msg}")
+
+        if e.code == 20003:
+            st.warning(
+                "Authentication failed. Check your Account SID and Auth Token."
+            )
+        elif e.code == 60200:
+            st.warning(
+                "The request contains an invalid parameter. "
+                "Check the phone number and Verify Service SID."
+            )
+        elif e.code == 60203:
+            st.warning(
+                "The maximum number of verification attempts may have "
+                "been reached. Wait before trying again."
+            )
+        elif e.code == 60205:
+            st.warning(
+                "The destination may not be reachable by this Verify service."
+            )
+        else:
+            st.info(
+                "Check the Twilio Verify error-code documentation for this code."
+            )
+
+    except Exception as e:
+        st.error(
+            f"Application error: {type(e).__name__}: {e}"
         )
 
 
-def verify_phone_otp(phone, entered_otp):
-    """Verify the SMS code using Twilio Verify."""
-
-    phone = phone.strip()
-    entered_otp = entered_otp.strip()
-
-    if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
-        return "❌ Enter a valid phone number.", "error"
-
-    if not re.fullmatch(r"\d{4,10}", entered_otp):
-        return "❌ Enter the verification code.", "error"
+def check_phone_otp(user_otp):
+    if not st.session_state.phone_verification_sent:
+        st.error("Please request an SMS OTP first.")
+        return
 
     if not TWILIO_VERIFY_SERVICE_SID:
-        return (
-            "❌ Twilio Verify Service SID is not configured.",
-            "error"
-        )
+        st.error("Twilio Verify Service SID is missing.")
+        return
 
     try:
-        client = get_twilio_client()
-
-        check = (
-            client.verify.v2
-            .services(TWILIO_VERIFY_SERVICE_SID)
-            .verification_checks.create(
-                to=phone,
-                code=entered_otp
-            )
+        client = Client(
+            TWILIO_ACCOUNT_SID,
+            TWILIO_AUTH_TOKEN
         )
 
-        if check.status == "approved":
+        result = client.verify.v2.services(
+            TWILIO_VERIFY_SERVICE_SID
+        ).verification_checks.create(
+            to=st.session_state.phone_number,
+            code=user_otp.strip()
+        )
+
+        if result.status == "approved":
             st.session_state.phone_verified = True
-            st.session_state.verified_phone_number = phone
+            st.session_state.phone_verification_sent = False
+            st.success("Phone number verified successfully!")
+        else:
+            st.error("Incorrect or expired OTP. Please try again.")
 
-            return (
-                "✅ Phone number verified successfully!",
-                "success"
-            )
+    except TwilioRestException as e:
+        st.error(f"Twilio verification error code: {e.code}")
+        st.error(f"Twilio message: {e.msg}")
 
-        return "❌ Invalid or expired OTP.", "error"
-
-    except Exception:
-        return (
-            "❌ Verification failed. The code may have "
-            "expired, or the Twilio request was rejected.",
-            "error"
+    except Exception as e:
+        st.error(
+            f"Application error: {type(e).__name__}: {e}"
         )
 
 
-# --------------------------------------------------
-# USER INTERFACE
-# --------------------------------------------------
+# ---------------- EMAIL VERIFICATION UI ----------------
 
-st.title("🔐 PragyanAI OTP Verification System")
+st.divider()
+st.subheader("📧 Email Verification")
 
-st.write(
-    "Securely verify your email address and phone number "
-    "using Python, Streamlit, Gmail SMTP, and Twilio."
+email = st.text_input(
+    "Enter your email address",
+    key="email_input",
+    placeholder="example@gmail.com"
 )
 
-st.info("Email OTPs expire after 5 minutes. Phone OTPs are managed by Twilio Verify.")
-
-# EMAIL VERIFICATION
-
-st.header("📧 Email Verification")
-
-with st.form("email_send_form"):
-    email = st.text_input(
-        "Email Address",
-        placeholder="example@gmail.com"
-    )
-    send_email_button = st.form_submit_button(
-        "Send Email OTP",
-        use_container_width=True
-    )
-
-if send_email_button:
-    message, kind = send_email(email)
-    if kind == "success":
-        st.success(message)
+if st.button("Send Email OTP", use_container_width=True):
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        st.error("Please enter a valid email address.")
     else:
-        st.error(message)
+        send_email_otp(email.strip())
 
-with st.form("email_verify_form"):
-    email_to_verify = st.text_input(
-        "Email Address for Verification",
-        placeholder="Enter the same email address"
-    )
-    email_otp_input = st.text_input(
-        "Enter Email OTP",
+if st.session_state.email_otp:
+    email_code = st.text_input(
+        "Enter the email OTP",
         max_chars=6,
-        placeholder="6-digit OTP"
-    )
-    verify_email_button = st.form_submit_button(
-        "Verify Email",
-        use_container_width=True
+        key="email_code"
     )
 
-if verify_email_button:
-    message, kind = verify_email(
-        email_to_verify,
-        email_otp_input
-    )
-    if kind == "success":
-        st.success(message)
-    else:
-        st.error(message)
+    if st.button("Verify Email OTP", use_container_width=True):
+        if len(email_code.strip()) != 6 or not email_code.strip().isdigit():
+            st.error("Enter the six-digit OTP.")
+        else:
+            verify_email_otp(email_code)
+
 
 if st.session_state.email_verified:
-    st.caption(
-        f"Verified email: "
-        f"{st.session_state.verified_email_address}"
-    )
+    st.success("✅ Email verification completed.")
 
+
+# ---------------- PHONE VERIFICATION UI ----------------
 
 st.divider()
+st.subheader("📱 Phone Verification")
 
-# PHONE VERIFICATION
+phone = st.text_input(
+    "Enter your phone number with country code",
+    placeholder="+919876543210"
+)
 
-st.header("📱 Phone Verification")
+if st.button("Send SMS OTP", use_container_width=True):
+    send_phone_otp(phone)
 
-with st.form("phone_send_form"):
-    phone = st.text_input(
-        "Phone Number",
-        placeholder="+919876543210",
-        help="Use international format, including the + country code."
-    )
-    send_phone_button = st.form_submit_button(
-        "Send SMS OTP",
-        use_container_width=True
-    )
-
-if send_phone_button:
-    message, kind = send_phone_otp(phone)
-    if kind == "success":
-        st.success(message)
-    else:
-        st.error(message)
-
-with st.form("phone_verify_form"):
-    phone_to_verify = st.text_input(
-        "Phone Number for Verification",
-        placeholder="Enter the same phone number"
-    )
-    phone_otp_input = st.text_input(
-        "Enter SMS OTP",
+if st.session_state.phone_verification_sent:
+    phone_code = st.text_input(
+        "Enter the SMS OTP",
         max_chars=10,
-        placeholder="Enter the code received"
-    )
-    verify_phone_button = st.form_submit_button(
-        "Verify Phone",
-        use_container_width=True
+        key="phone_code"
     )
 
-if verify_phone_button:
-    message, kind = verify_phone_otp(
-        phone_to_verify,
-        phone_otp_input
-    )
-    if kind == "success":
-        st.success(message)
-    else:
-        st.error(message)
+    if st.button("Verify Phone OTP", use_container_width=True):
+        if not phone_code.strip().isdigit():
+            st.error("Enter the numeric OTP received by SMS.")
+        else:
+            check_phone_otp(phone_code)
+
 
 if st.session_state.phone_verified:
-    st.caption(
-        f"Verified phone: "
-        f"{st.session_state.verified_phone_number}"
-    )
+    st.success("✅ Phone verification completed.")
+
+
+# ---------------- FINAL STATUS ----------------
 
 st.divider()
+st.subheader("📋 Verification Status")
 
-if (
-    st.session_state.email_verified
-    and st.session_state.phone_verified
-):
-    st.success("🎉 Both email and phone number are verified!")
+st.write(
+    f"Email: {'Verified ✅' if st.session_state.email_verified else 'Not verified'}"
+)
 
-st.caption("Developed as a PragyanAI Python project.")
+st.write(
+    f"Phone: {'Verified ✅' if st.session_state.phone_verified else 'Not verified'}"
+)
+
+if st.session_state.email_verified and st.session_state.phone_verified:
+    st.balloons()
+    st.success("🎉 Both email and phone verification are complete!")
