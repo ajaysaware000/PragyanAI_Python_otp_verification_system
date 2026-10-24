@@ -48,7 +48,6 @@ PragyanAI-OTP-Verification-System/
 ├── app.py
 ├── requirements.txt
 ├── README.md
-├── .gitignore
 ```
 
 ## ⚙️ Installation and Setup
